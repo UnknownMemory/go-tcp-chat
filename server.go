@@ -2,10 +2,13 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"strings"
+	"sync"
 )
 
 const (
@@ -16,12 +19,15 @@ const (
 	RED   = "\033[31m"
 )
 
-type Connection struct {
-	addr     string
+var (
+	clients = make(map[net.Conn]Client)
+	mu      sync.Mutex
+)
+
+type Client struct {
+	conn     net.Conn
 	username string
 }
-
-var connections = make(map[net.Conn]Connection)
 
 func main() {
 	listener, err := net.Listen("tcp", PORT)
@@ -43,7 +49,17 @@ func main() {
 }
 
 func handleConnection(conn net.Conn) {
-	defer conn.Close()
+	defer func(conn net.Conn) {
+		err := conn.Close()
+		if err != nil {
+			log.Printf("Error: %s", err)
+		}
+
+		mu.Lock()
+		delete(clients, conn)
+		mu.Unlock()
+	}(conn)
+
 	connAddr := conn.RemoteAddr().String()
 	reader := bufio.NewReader(conn)
 
@@ -52,15 +68,17 @@ func handleConnection(conn net.Conn) {
 		fmt.Printf("Error: %s\n", err)
 		return
 	}
+	client := Client{conn, username}
 
-	connections[conn] = Connection{conn.RemoteAddr().String(), username}
+	mu.Lock()
+	clients[conn] = client
+	mu.Unlock()
 
 	fmt.Printf("Handling connection: %s\n", connAddr)
 	for {
 		message, err := reader.ReadString('\n')
-		message = strings.TrimSpace(message)
 		if err != nil {
-			if err.Error() == "EOF" {
+			if errors.Is(err, io.EOF) {
 				fmt.Printf("Connection closed: %s\n", connAddr)
 			} else {
 				fmt.Printf("Error: %s\n", err)
@@ -69,7 +87,12 @@ func handleConnection(conn net.Conn) {
 			break
 		}
 
-		fmt.Printf("%s: %s\n", connections[conn].username, message)
+		message = strings.TrimSpace(message)
+		if message == "" {
+			continue
+		}
+
+		broadcast(client, message)
 	}
 }
 
@@ -99,4 +122,24 @@ func setUsername(conn net.Conn, reader *bufio.Reader) (string, error) {
 	}
 
 	return username, nil
+}
+
+func broadcast(sender Client, message string) {
+	mu.Lock()
+	clientsBroadcast := make([]Client, 0, len(clients))
+	for _, client := range clients {
+		clientsBroadcast = append(clientsBroadcast, client)
+	}
+	mu.Unlock()
+
+	fMessage := fmt.Sprintf("%s: %s\n", sender.username, message)
+	bMessage := []byte(fMessage)
+	for _, client := range clientsBroadcast {
+		go func(client Client, bMessage []byte) {
+			_, err := client.conn.Write(bMessage)
+			if err != nil {
+				log.Printf("Error: %s", err)
+			}
+		}(client, bMessage)
+	}
 }
