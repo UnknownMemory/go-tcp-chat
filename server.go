@@ -36,6 +36,7 @@ func main() {
 	}
 
 	defer listener.Close()
+	log.Printf("[INFO] Server is running on %s\n", listener.Addr())
 
 	for {
 		conn, err := listener.Accept()
@@ -74,14 +75,14 @@ func handleConnection(conn net.Conn) {
 	clients[conn] = client
 	mu.Unlock()
 
-	fmt.Printf("Handling connection: %s\n", connAddr)
+	log.Printf("[INFO] [CONNECTION] New connection established from %s\n", connAddr)
 	for {
 		message, err := reader.ReadString('\n')
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				fmt.Printf("Connection closed: %s\n", connAddr)
+				log.Printf("[INFO] [CONNECTION] %s (%s) has closed the connection \n", client.username, client.conn.RemoteAddr().String())
 			} else {
-				fmt.Printf("Error: %s\n", err)
+				log.Printf("Error: %s\n", err)
 			}
 
 			break
@@ -142,4 +143,6 @@ func broadcast(sender Client, message string) {
 			}
 		}(client, bMessage)
 	}
+
+	log.Printf("[DATA] [BROADCAST] [%s]: %s\n", sender.username, message)
 }
