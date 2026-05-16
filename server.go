@@ -8,8 +8,9 @@ import (
 	"log"
 	"net"
 	"strings"
-	"sync"
 )
+
+type Action int
 
 const (
 	PORT = ":9000"
@@ -17,16 +18,21 @@ const (
 	// Colors
 	RESET = "\033[0m"
 	RED   = "\033[31m"
-)
 
-var (
-	clients = make(map[net.Conn]Client)
-	mu      sync.Mutex
+	Register Action = iota
+	Unregister
+	Broadcast
 )
 
 type Client struct {
 	conn     net.Conn
 	username string
+}
+
+type Event struct {
+	client  *Client
+	action  Action
+	payload string
 }
 
 func main() {
@@ -38,6 +44,9 @@ func main() {
 	defer listener.Close()
 	log.Printf("[INFO] Server is running on %s\n", listener.Addr())
 
+	event := make(chan Event)
+	go chat(event)
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -45,23 +54,39 @@ func main() {
 			continue
 		}
 
-		go handleConnection(conn)
+		go handleConnection(conn, event)
 	}
 }
 
-func handleConnection(conn net.Conn) {
-	defer func(conn net.Conn) {
-		err := conn.Close()
-		if err != nil {
-			log.Printf("Error: %s", err)
+func chat(message chan Event) {
+	clients := make(map[net.Conn]Client)
+	for msg := range message {
+		switch msg.action {
+		case Unregister:
+			delete(clients, msg.client.conn)
+			log.Printf("[INFO] [CONNECTION] %s (%s) has closed the connection \n", msg.client.username, msg.client.conn.RemoteAddr().String())
+		case Register:
+			clients[msg.client.conn] = *msg.client
+			log.Printf("[INFO] [CONNECTION] New connection established from %s\n", msg.client.conn.RemoteAddr().String())
+		case Broadcast:
+			fMessage := fmt.Sprintf("%s: %s\n", msg.client.username, msg.payload)
+			bMessage := []byte(fMessage)
+			for _, client := range clients {
+				_, err := client.conn.Write(bMessage)
+				if err != nil {
+					log.Printf("Error: %s", err)
+				}
+			}
+
+			log.Printf("[DATA] [BROADCAST] [%s]: %s\n", msg.client.username, msg.payload)
+		default:
+			log.Printf("Invalid action")
 		}
 
-		mu.Lock()
-		delete(clients, conn)
-		mu.Unlock()
-	}(conn)
+	}
+}
 
-	connAddr := conn.RemoteAddr().String()
+func handleConnection(conn net.Conn, event chan Event) {
 	reader := bufio.NewReader(conn)
 
 	username, err := setUsername(conn, reader)
@@ -69,23 +94,24 @@ func handleConnection(conn net.Conn) {
 		fmt.Printf("Error: %s\n", err)
 		return
 	}
-	client := Client{conn, username}
+	client := &Client{conn, username}
+	event <- Event{client, Register, ""}
 
-	mu.Lock()
-	clients[conn] = client
-	mu.Unlock()
+	defer func(conn net.Conn) {
+		event <- Event{client, Unregister, ""}
+		err := conn.Close()
+		if err != nil {
+			log.Printf("Error: %s", err)
+		}
+	}(conn)
 
-	log.Printf("[INFO] [CONNECTION] New connection established from %s\n", connAddr)
 	for {
 		message, err := reader.ReadString('\n')
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				log.Printf("[INFO] [CONNECTION] %s (%s) has closed the connection \n", client.username, client.conn.RemoteAddr().String())
-			} else {
-				log.Printf("Error: %s\n", err)
+				break
 			}
-
-			break
+			log.Printf("Error: %s\n", err)
 		}
 
 		message = strings.TrimSpace(message)
@@ -93,7 +119,7 @@ func handleConnection(conn net.Conn) {
 			continue
 		}
 
-		broadcast(client, message)
+		event <- Event{client, Broadcast, message}
 	}
 }
 
@@ -123,26 +149,4 @@ func setUsername(conn net.Conn, reader *bufio.Reader) (string, error) {
 	}
 
 	return username, nil
-}
-
-func broadcast(sender Client, message string) {
-	mu.Lock()
-	clientsBroadcast := make([]Client, 0, len(clients))
-	for _, client := range clients {
-		clientsBroadcast = append(clientsBroadcast, client)
-	}
-	mu.Unlock()
-
-	fMessage := fmt.Sprintf("%s: %s\n", sender.username, message)
-	bMessage := []byte(fMessage)
-	for _, client := range clientsBroadcast {
-		go func(client Client, bMessage []byte) {
-			_, err := client.conn.Write(bMessage)
-			if err != nil {
-				log.Printf("Error: %s", err)
-			}
-		}(client, bMessage)
-	}
-
-	log.Printf("[DATA] [BROADCAST] [%s]: %s\n", sender.username, message)
 }
