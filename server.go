@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"time"
 )
 
 type Action int
@@ -24,9 +25,15 @@ const (
 	Broadcast
 )
 
+type Server struct {
+	listener net.Listener
+	event    chan Event
+}
+
 type Client struct {
 	conn     net.Conn
 	username string
+	messages chan []byte
 }
 
 type Event struct {
@@ -35,32 +42,36 @@ type Event struct {
 	payload string
 }
 
-func main() {
+func NewServer() *Server {
 	listener, err := net.Listen("tcp", PORT)
 	if err != nil {
 		log.Fatalf("Error: %s", err)
 	}
-
-	defer listener.Close()
 	log.Printf("[INFO] Server is running on %s\n", listener.Addr())
 
-	event := make(chan Event)
-	go chat(event)
+	return &Server{listener, make(chan Event)}
+}
 
+func (s *Server) run() {
+	go s.chat()
+	s.accept()
+}
+
+func (s *Server) accept() {
 	for {
-		conn, err := listener.Accept()
+		conn, err := s.listener.Accept()
 		if err != nil {
 			log.Printf("Error: %s", err)
 			continue
 		}
 
-		go handleConnection(conn, event)
+		go s.handleConnection(conn, s.event)
 	}
 }
 
-func chat(message chan Event) {
+func (s *Server) chat() {
 	clients := make(map[net.Conn]Client)
-	for msg := range message {
+	for msg := range s.event {
 		switch msg.action {
 		case Unregister:
 			delete(clients, msg.client.conn)
@@ -72,21 +83,26 @@ func chat(message chan Event) {
 			fMessage := fmt.Sprintf("%s: %s\n", msg.client.username, msg.payload)
 			bMessage := []byte(fMessage)
 			for _, client := range clients {
-				_, err := client.conn.Write(bMessage)
-				if err != nil {
-					log.Printf("Error: %s", err)
+				select {
+				case client.messages <- bMessage:
+				default:
+					err := client.conn.Close()
+					if err != nil {
+						log.Printf("Connection close error: %s", err)
+					}
+					delete(clients, client.conn)
 				}
 			}
 
 			log.Printf("[DATA] [BROADCAST] [%s]: %s\n", msg.client.username, msg.payload)
 		default:
-			log.Printf("Invalid action")
+			log.Printf("[ERROR] Invalid action")
 		}
 
 	}
 }
 
-func handleConnection(conn net.Conn, event chan Event) {
+func (s *Server) handleConnection(conn net.Conn, event chan Event) {
 	reader := bufio.NewReader(conn)
 
 	username, err := setUsername(conn, reader)
@@ -94,7 +110,7 @@ func handleConnection(conn net.Conn, event chan Event) {
 		fmt.Printf("Error: %s\n", err)
 		return
 	}
-	client := &Client{conn, username}
+	client := &Client{conn, username, make(chan []byte)}
 	event <- Event{client, Register, ""}
 
 	defer func(conn net.Conn) {
@@ -105,6 +121,8 @@ func handleConnection(conn net.Conn, event chan Event) {
 		}
 	}(conn)
 
+	go clientWriter(client)
+
 	for {
 		message, err := reader.ReadString('\n')
 		if err != nil {
@@ -112,6 +130,7 @@ func handleConnection(conn net.Conn, event chan Event) {
 				break
 			}
 			log.Printf("Error: %s\n", err)
+			break
 		}
 
 		message = strings.TrimSpace(message)
@@ -149,4 +168,17 @@ func setUsername(conn net.Conn, reader *bufio.Reader) (string, error) {
 	}
 
 	return username, nil
+}
+
+func clientWriter(client *Client) {
+	for message := range client.messages {
+		err := client.conn.SetWriteDeadline(time.Now().Add(20 * time.Second))
+		if err != nil {
+			log.Printf("Write deadline error: %s", err)
+		}
+		_, err = client.conn.Write(message)
+		if err != nil {
+			log.Printf("Write error: %s", err)
+		}
+	}
 }
