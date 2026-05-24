@@ -22,6 +22,7 @@ const (
 	Register Action = iota
 	Unregister
 	Broadcast
+	Shutdown
 )
 
 type Server struct {
@@ -93,8 +94,10 @@ func (s *Server) Close() {
 	if err != nil {
 		log.Printf("Error closing listener: %s", err)
 	}
-	close(s.event)
+	s.event <- Event{action: Shutdown}
 	s.connWg.Wait()
+	close(s.event)
+
 }
 
 func (s *Server) chat() {
@@ -130,14 +133,13 @@ func (s *Server) chat() {
 			}
 
 			log.Printf("[DATA] [BROADCAST] [%s]: %s\n", msg.client.username, msg.payload)
+		case Shutdown:
+			for _, client := range clients {
+				client.conn.Close()
+			}
 		default:
 			log.Printf("[ERROR] Invalid action")
 		}
-	}
-
-	for _, client := range clients {
-		close(client.messages)
-		client.conn.Close()
 	}
 }
 
@@ -157,14 +159,7 @@ func (s *Server) handleConnection(conn net.Conn, event chan Event) {
 	go s.clientWriter(client)
 
 	defer func() {
-		select {
-		case event <- Event{client, Unregister, ""}:
-		case <-s.ctx.Done():
-			err = conn.Close()
-			if err != nil {
-				log.Printf("Error closing connection: %s", err)
-			}
-		}
+		event <- Event{client, Unregister, ""}
 	}()
 
 	for {
