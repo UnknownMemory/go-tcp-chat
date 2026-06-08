@@ -18,10 +18,12 @@ const (
 	// Colors
 	RESET = "\033[0m"
 	RED   = "\033[31m"
+	GREEN = "\033[32m"
 
 	Register Action = iota
 	Unregister
 	Broadcast
+	CMD
 	Shutdown
 )
 
@@ -45,6 +47,19 @@ type Event struct {
 	client  *Client
 	action  Action
 	payload string
+}
+
+type command struct {
+	command string
+	desc    string
+	args    []string
+}
+
+var commands = map[string]command{
+	"help":     {"help", "Displays a list of available commands", []string{}},
+	"username": {"username", "Changes the username of the current user", []string{"username"}},
+	"users":    {"users", "Displays a list of connected users", []string{}},
+	"quit":     {"quit", "Exits the chat", []string{}},
 }
 
 func NewServer(addr string) (*Server, error) {
@@ -133,6 +148,46 @@ func (s *Server) chat() {
 			}
 
 			log.Printf("[DATA] [BROADCAST] [%s]: %s\n", msg.client.username, msg.payload)
+		case CMD:
+			cmd := strings.Split(msg.payload, " ")
+			args := cmd[1:]
+
+			switch cmd[0] {
+			case "/help":
+				for _, c := range commands {
+					_, err := fmt.Fprintf(msg.client.conn, GREEN+"%s - %s <%s>\n"+RESET, c.command, c.desc, strings.Join(c.args, ", "))
+					if err != nil {
+						log.Printf("Error: %s", err)
+					}
+				}
+			case "/username":
+				if len(args) != 1 {
+					_, err := fmt.Fprintf(msg.client.conn, RED+"Invalid arguments. Usage: /username <new username>\n"+RESET)
+					if err != nil {
+						log.Printf("Error: %s", err)
+					}
+					break
+				}
+
+				clients[msg.client.conn].username = args[0]
+
+				_, err := fmt.Fprintf(msg.client.conn, GREEN+"Your username has been changed!\n"+RESET)
+				if err != nil {
+					log.Printf("Error: %s", err)
+				}
+			case "/users":
+				users := make([]string, 0, len(clients))
+				for _, client := range clients {
+					users = append(users, client.username)
+				}
+				_, err := fmt.Fprintf(msg.client.conn, GREEN+"Connected users:\n%s\n"+RESET, strings.Join(users, "\n"))
+				if err != nil {
+					log.Printf("Error: %s", err)
+				}
+			case "/quit":
+				msg.client.conn.Close()
+			}
+
 		case Shutdown:
 			for _, client := range clients {
 				client.conn.Close()
@@ -163,6 +218,8 @@ func (s *Server) handleConnection(conn net.Conn, event chan Event) {
 	}()
 
 	for {
+		eventType := Broadcast
+
 		message, err := reader.ReadString('\n')
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -177,8 +234,22 @@ func (s *Server) handleConnection(conn net.Conn, event chan Event) {
 			continue
 		}
 
+		if strings.HasPrefix(message, "/") {
+			cmd := strings.Split(message, " ")
+
+			if _, exists := commands[strings.TrimPrefix(cmd[0], "/")]; !exists {
+				_, err = fmt.Fprintf(conn, RED+"Invalid command. Type /help for a list of available commands.\n"+RESET)
+				if err != nil {
+					log.Printf("Error: %s", err)
+					continue
+				}
+			}
+
+			eventType = CMD
+		}
+
 		select {
-		case event <- Event{client, Broadcast, message}:
+		case event <- Event{client, eventType, message}:
 		case <-s.ctx.Done():
 			return
 		}
