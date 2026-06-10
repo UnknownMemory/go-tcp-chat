@@ -2,38 +2,57 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"net"
+	"os"
 	"strings"
 	"testing"
 )
 
-func setupDial(t *testing.T) func() (net.Conn, *bufio.Scanner) {
-	t.Helper()
+var addr string
 
+func TestMain(m *testing.M) {
 	s, err := NewServer("127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("Failed to create server: %s", err)
+		fmt.Printf("Failed to create server: %s\n", err)
+		os.Exit(1)
 	}
 
 	go s.Run()
 
-	t.Cleanup(func() {
-		s.Close()
-	})
+	addr = s.listener.Addr().String()
 
-	return func() (net.Conn, *bufio.Scanner) {
-		conn, err := net.Dial("tcp", s.listener.Addr().String())
-		if err != nil {
-			t.Fatalf("Fail to dial server: %s", err)
-		}
+	exitCode := m.Run()
 
-		return conn, bufio.NewScanner(conn)
+	s.Close()
+	os.Exit(exitCode)
+}
+
+func setupDial(t *testing.T) (net.Conn, *bufio.Scanner) {
+	t.Helper()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Fail to dial server: %s", err)
+	}
+
+	return conn, bufio.NewScanner(conn)
+}
+
+func setupUsername(t *testing.T, conn net.Conn, scanner *bufio.Scanner, username string) {
+	t.Helper()
+	if !scanner.Scan() {
+		t.Fatalf("Failed to read prompt: %s", scanner.Err())
+	}
+
+	_, err := conn.Write([]byte(username + "\n"))
+	if err != nil {
+		t.Fatalf("Failed to write username: %s", err)
 	}
 }
 
 func TestUsernamePrompt(t *testing.T) {
-	dial := setupDial(t)
-	conn1, scanner1 := dial()
+	conn1, scanner1 := setupDial(t)
 	defer conn1.Close()
 
 	if !scanner1.Scan() {
@@ -53,33 +72,18 @@ func TestUsernamePrompt(t *testing.T) {
 }
 
 func TestMessageBroadcast(t *testing.T) {
-	dial := setupDial(t)
-	conn1, scanner1 := dial()
+	conn1, scanner1 := setupDial(t)
 	defer conn1.Close()
 
-	if !scanner1.Scan() {
-		t.Fatalf("Failed to read prompt: %s", scanner1.Err())
-	}
+	setupUsername(t, conn1, scanner1, "user1")
 
-	_, err := conn1.Write([]byte("user1\n"))
-	if err != nil {
-		t.Fatalf("Failed to write username: %s", err)
-	}
-
-	conn2, scanner2 := dial()
+	conn2, scanner2 := setupDial(t)
 	defer conn2.Close()
 
-	if !scanner2.Scan() {
-		t.Fatalf("Client 2 failed to read prompt: %s", scanner1.Err())
-	}
-
-	_, err = conn2.Write([]byte("user2\n"))
-	if err != nil {
-		t.Fatalf("Client 2 failed to write username: %s", err)
-	}
+	setupUsername(t, conn2, scanner2, "user2")
 
 	broadcastMessage := "Hello world."
-	_, err = conn1.Write([]byte(broadcastMessage + "\n"))
+	_, err := conn1.Write([]byte(broadcastMessage + "\n"))
 	if err != nil {
 		t.Fatalf("Client 1 failed to send message: %s", err)
 	}
@@ -94,4 +98,89 @@ func TestMessageBroadcast(t *testing.T) {
 	if receivedMessage != expectedMessage {
 		t.Fatalf("Expected message %q, but got %q", expectedMessage, receivedMessage)
 	}
+}
+
+func TestCommands(t *testing.T) {
+	conn, scanner := setupDial(t)
+	defer conn.Close()
+
+	setupUsername(t, conn, scanner, "user1")
+
+	t.Run("Testing /help command", func(t *testing.T) {
+		_, err := conn.Write([]byte("/help\n"))
+		if err != nil {
+			t.Errorf("Failed to send command /help: %s", err)
+		}
+
+		if !scanner.Scan() {
+			t.Errorf("Failed to read prompt: %s", scanner.Err())
+		}
+
+		helpCommand := scanner.Text()
+		if !strings.Contains(helpCommand, "Displays a list of available commands") {
+			t.Errorf("Failed to display /help command: %s", helpCommand)
+		}
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.Contains(line, "\033[0m") {
+				break
+			}
+		}
+	})
+
+	t.Run("Testing /users command", func(t *testing.T) {
+		_, err := conn.Write([]byte("/users\n"))
+		if err != nil {
+			t.Errorf("Failed to send command /users: %s", err)
+		}
+
+		if !scanner.Scan() {
+			t.Errorf("Failed to read prompt: %s", scanner.Err())
+		}
+
+		usersCommand := scanner.Text()
+		if !strings.Contains(usersCommand, "Connected users:") {
+			t.Errorf("Failed to display /users command: %s", usersCommand)
+		}
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.Contains(line, "\033[0m") {
+				break
+			}
+		}
+	})
+
+	t.Run("Testing /username command", func(t *testing.T) {
+		_, err := conn.Write([]byte("/username newUsername\n"))
+		if err != nil {
+			t.Errorf("Failed to send command /username: %s", err)
+		}
+
+		if !scanner.Scan() {
+			t.Errorf("Failed to read prompt: %s", scanner.Err())
+		}
+
+		usernameCommand := scanner.Text()
+		if !strings.Contains(usernameCommand, "Your username has been changed") {
+			t.Errorf("Failed to display /username command: %s", usernameCommand)
+		}
+	})
+
+	t.Run("Testing /quit command", func(t *testing.T) {
+		_, err := conn.Write([]byte("/quit\n"))
+		if err != nil {
+			t.Errorf("Failed to send command /username: %s", err)
+		}
+
+		if !scanner.Scan() {
+			t.Errorf("Failed to read prompt: %s", scanner.Err())
+		}
+
+		_, err = conn.Read(make([]byte, 1))
+		if err == nil {
+			t.Fatal("Failed to quit")
+		}
+	})
 }
