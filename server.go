@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Action int
@@ -26,6 +27,12 @@ const (
 	Broadcast
 	CMD
 	Shutdown
+)
+
+const (
+	writeWait  = 15 * time.Second
+	readWait   = 60 * time.Second
+	pingTicker = 30 * time.Second
 )
 
 type Server struct {
@@ -63,7 +70,7 @@ var commands = []command{
 	{"quit", "Exits the chat", []string{}},
 }
 
-func NewServer(addr string) (*Server, error) {
+func NewServer(addr string) (server *Server, err error) {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("Error: %s\n", err)
@@ -176,8 +183,19 @@ func (s *Server) chat() {
 					break
 				}
 
-				msg.client.username = args[0]
+				newUsername := args[0]
+				if len(newUsername) == 0 || len(newUsername) > 16 {
+					_, err := fmt.Fprint(msg.client.conn, RED+"Invalid username. The username must be between 1 and 16 characters long.\n"+RESET)
+					if err != nil {
+						log.Printf("Error: %s", err)
+					}
+					break
+				}
 
+				oldUsername := msg.client.username
+				msg.client.username = newUsername
+
+				log.Printf("[DATA] [USER] Username changed: %s -> %s", oldUsername, args[0])
 				_, err := fmt.Fprintf(msg.client.conn, GREEN+"Your username has been changed!\n"+RESET)
 				if err != nil {
 					log.Printf("Error: %s", err)
@@ -211,7 +229,15 @@ func (s *Server) handleConnection(conn net.Conn, event chan Event) {
 	reader := bufio.NewReader(conn)
 	username, err := s.setUsername(conn, reader)
 	if err != nil {
-		fmt.Printf("Error: %s\n", err)
+		if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
+			log.Printf("[INFO] [CONNECTION] %s timed out during handshake\n", conn.RemoteAddr().String())
+			_, err = fmt.Fprint(conn, RED+"Connection timed out due to inactivity.\n"+RESET)
+			if err != nil {
+				fmt.Printf("Error: %s", err)
+			}
+		} else {
+			fmt.Printf("Error: %s\n", err)
+		}
 		return
 	}
 	client := &Client{conn, username, make(chan []byte, 16)}
@@ -221,6 +247,7 @@ func (s *Server) handleConnection(conn net.Conn, event chan Event) {
 	go s.clientWriter(client)
 
 	defer func() {
+		conn.Close()
 		event <- Event{client, Unregister, ""}
 	}()
 
@@ -264,7 +291,12 @@ func (s *Server) setUsername(conn net.Conn, reader *bufio.Reader) (string, error
 	var username string
 
 	for {
-		_, err := fmt.Fprint(conn, "Enter a username (max 16 characters):\n")
+		err := conn.SetReadDeadline(time.Now().Add(readWait))
+		if err != nil {
+			return "", err
+		}
+
+		_, err = fmt.Fprint(conn, "Enter a username (max 16 characters):\n")
 		if err != nil {
 			return "", err
 		}
@@ -291,11 +323,37 @@ func (s *Server) setUsername(conn net.Conn, reader *bufio.Reader) (string, error
 func (s *Server) clientWriter(client *Client) {
 	defer s.connWg.Done()
 
-	for message := range client.messages {
-		_, err := client.conn.Write(message)
-		if err != nil {
-			log.Printf("Write error: %s", err)
-			return
+	ping := time.NewTicker(pingTicker)
+	defer ping.Stop()
+
+	for {
+		select {
+		case message, ok := <-client.messages:
+			if !ok {
+				return
+			}
+			err := client.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err != nil {
+				return
+			}
+			_, err = client.conn.Write(message)
+			if err != nil {
+				log.Printf("Write error: %s", err)
+				return
+			}
+		case <-ping.C:
+			err := client.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err != nil {
+				return
+			}
+
+			_, err = client.conn.Write([]byte("\x00"))
+			if err != nil {
+				log.Printf("Write error: %s", err)
+				return
+			}
+
+			log.Printf("[INFO] [CONNECTION] PING %s", client.username)
 		}
 	}
 

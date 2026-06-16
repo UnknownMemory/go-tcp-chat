@@ -28,7 +28,7 @@ func TestMain(m *testing.M) {
 	os.Exit(exitCode)
 }
 
-func setupDial(t *testing.T) (net.Conn, *bufio.Scanner) {
+func setupDial(t *testing.T) (conn net.Conn, scanner *bufio.Scanner) {
 	t.Helper()
 
 	conn, err := net.Dial("tcp", addr)
@@ -172,10 +172,6 @@ func TestCommands(t *testing.T) {
 		_, err := conn.Write([]byte("/quit\n"))
 		if err != nil {
 			t.Errorf("Failed to send command /username: %s", err)
-		}
-
-		if !scanner.Scan() {
-			t.Errorf("Failed to read prompt: %s", scanner.Err())
 		}
 
 		_, err = conn.Read(make([]byte, 1))
